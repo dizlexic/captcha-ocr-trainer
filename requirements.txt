@@ -1,0 +1,11 @@
+torch
+torchvision
+torchaudio
+numpy
+opencv-python
+pillow
+onnx
+onnxruntime
+onnxscript
+# tqdm is optional for training progress bars
+# ollama and moondream-related deps are no longer needed (distillation removed)
