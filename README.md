@@ -3,6 +3,7 @@
 This project provides tools to train a CRNN (Convolutional Recurrent Neural Network) OCR model and test it using ONNX runtime.
 
 ## Overview
+- Purpose: Optimized for recognizing 4 distorted characters in an image (e.g., CAPTCHAs).
 - Architecture: CNN (feature extraction) + BiLSTM (sequence modeling) + CTC Loss.
 - Training: PyTorch-based training script.
 - Inference: ONNX Runtime support for efficient deployment.
@@ -40,6 +41,10 @@ The training script reads the labels from `labels.jsonl`, trains the CRNN model,
 1. Start training:
    ```bash
    python train.py
+   ```
+   Or with custom parameters:
+   ```bash
+   python train.py --epochs 200 --min-len 3 --max-len 5
    ```
 2. The script will:
    - Load the dataset from `datasets/ocr/`.
