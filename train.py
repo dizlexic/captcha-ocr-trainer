@@ -10,12 +10,14 @@ import sys
 from model import CRNN
 
 class CaptchaDataset(Dataset):
-    def __init__(self, data_dir, labels_file, characters, img_w=100, img_h=32):
+    def __init__(self, data_dir, labels_file, characters, img_w=100, img_h=32, min_len=4, max_len=4):
         self.data_dir = data_dir
         self.img_w = img_w
         self.img_h = img_h
         self.characters = characters
         self.char_map = {char: i + 1 for i, char in enumerate(characters)}
+        self.min_len = min_len
+        self.max_len = max_len
 
         self.data = []
         with open(labels_file, 'r') as f:
@@ -53,7 +55,7 @@ class CaptchaDataset(Dataset):
         label_text = "".join([c for c in label_text if c in self.char_map and not c.isspace()])
 
         # If it's a hallucination (too long) or empty, skip
-        if len(label_text) > 4 or len(label_text) < 2:
+        if len(label_text) > self.max_len or len(label_text) < self.min_len:
             return torch.from_numpy(img), torch.LongTensor([]), 0
 
         target = [self.char_map[c] for c in label_text]
@@ -69,7 +71,7 @@ def collate_fn(batch):
     target_lens = torch.IntTensor(target_lens)
     return imgs, targets_flat, target_lens
 
-def train(num_epochs=100):
+def train(num_epochs=100, min_len=4, max_len=4):
     # Config
     DATA_DIR = "datasets/ocr"
     LABELS_FILE = os.path.join(DATA_DIR, "labels.jsonl")
@@ -79,7 +81,7 @@ def train(num_epochs=100):
     characters = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
     n_class = len(characters) + 1  # +1 for blank
 
-    dataset = CaptchaDataset(DATA_DIR, LABELS_FILE, characters)
+    dataset = CaptchaDataset(DATA_DIR, LABELS_FILE, characters, min_len=min_len, max_len=max_len)
     if len(dataset) == 0:
         print("No data to train on.")
         return
@@ -161,10 +163,15 @@ def train(num_epochs=100):
             print(f"Error: Legacy export also failed: {le}")
 
 if __name__ == "__main__":
-    epochs = 100
-    if len(sys.argv) > 1:
-        try:
-            epochs = int(sys.argv[1])
-        except ValueError:
-            pass
-    train(num_epochs=epochs)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--min-len", type=int, default=4)
+    parser.add_argument("--max-len", type=int, default=4)
+    args = parser.parse_args()
+
+    if args.min_len > args.max_len:
+        print("Error: --min-len cannot be greater than --max-len")
+        sys.exit(1)
+
+    train(num_epochs=args.epochs, min_len=args.min_len, max_len=args.max_len)
