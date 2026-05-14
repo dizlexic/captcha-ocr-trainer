@@ -13,7 +13,7 @@ class CRNN(nn.Module):
 
         cnn = nn.Sequential()
 
-        def convRelu(i, batchNormalization=False):
+        def convRelu(i, batchNormalization=False, dropout=False):
             nIn = nc if i == 0 else nm[i - 1]
             nOut = nm[i]
             cnn.add_module('conv{0}'.format(i),
@@ -21,6 +21,8 @@ class CRNN(nn.Module):
             if batchNormalization:
                 cnn.add_module('batchnorm{0}'.format(i), nn.BatchNorm2d(nOut))
             cnn.add_module('relu{0}'.format(i), nn.ReLU(True))
+            if dropout:
+                cnn.add_module('dropout{0}'.format(i), nn.Dropout2d(0.2))
 
         convRelu(0)
         cnn.add_module('pooling{0}'.format(0), nn.MaxPool2d(2, 2))  # 64x16x64
@@ -29,17 +31,28 @@ class CRNN(nn.Module):
         convRelu(2, True)
         convRelu(3)
         cnn.add_module('pooling{0}'.format(2),
-                       nn.MaxPool2d((2, 2), (2, 1), (0, 1)))  # 256x4x16
-        convRelu(4, True)
-        convRelu(5)
+                       nn.MaxPool2d(2, 2))  # 256x4x12
+        convRelu(4, True, dropout=True)
+        convRelu(5, dropout=True)
         cnn.add_module('pooling{0}'.format(3),
-                       nn.MaxPool2d((2, 2), (2, 1), (0, 1)))  # 512x2x16
+                       nn.MaxPool2d((2, 2), (2, 1), (0, 1)))  # 512x2x12
         convRelu(6, True)  # 512x1x16
 
         self.cnn = cnn
         self.rnn = nn.Sequential(
             BidirectionalLSTM(512, nh, nh),
             BidirectionalLSTM(nh, nh, n_class))
+            
+        # Initialization
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.constant_(m.bias, 0)
 
     def forward(self, input):
         # conv features
@@ -58,10 +71,12 @@ class BidirectionalLSTM(nn.Module):
     def __init__(self, nIn, nHidden, nOut):
         super(BidirectionalLSTM, self).__init__()
         self.rnn = nn.LSTM(nIn, nHidden, bidirectional=True)
+        self.dropout = nn.Dropout(0.2)
         self.embedding = nn.Linear(nHidden * 2, nOut)
 
     def forward(self, input):
         recurrent, _ = self.rnn(input)
+        recurrent = self.dropout(recurrent)
         T, b, h = recurrent.size()
         t_rec = recurrent.view(T * b, h)
 
