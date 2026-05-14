@@ -1,16 +1,26 @@
+import os
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import cv2
 import numpy as np
-import os
 import json
 import sys
+import logging
 from model import CRNN
 
+# Configure logging
+logging.basicConfig(filename='training.log', level=logging.INFO, 
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+logging.getLogger('').addHandler(console)
+
 class CaptchaDataset(Dataset):
-    def __init__(self, data_dir, labels_file, characters, img_w=100, img_h=32, min_len=4, max_len=4):
+    def __init__(self, data_dir, labels_file, characters, img_w=100, img_h=32, min_len=4, max_len=4, data=None):
         self.data_dir = data_dir
         self.img_w = img_w
         self.img_h = img_h
@@ -19,10 +29,21 @@ class CaptchaDataset(Dataset):
         self.min_len = min_len
         self.max_len = max_len
 
-        self.data = []
-        with open(labels_file, 'r') as f:
-            for line in f:
-                self.data.append(json.loads(line))
+        if data is not None:
+            self.data = data
+        else:
+            self.data = []
+            with open(labels_file, 'r') as f:
+                for line in f:
+                    record = json.loads(line)
+                    # Pre-filter for valid records
+                    is_correct = record.get('isCorrect', False)
+                    label_raw = record.get('label', '')
+                    if is_correct and len(label_raw.strip()) > 0:
+                        label_text = "".join([c for c in label_raw if c in self.char_map and not c.isspace()])
+                        if self.min_len <= len(label_text) <= self.max_len:
+                            record['clean_label'] = label_text
+                            self.data.append(record)
 
     def __len__(self):
         return len(self.data)
@@ -41,23 +62,7 @@ class CaptchaDataset(Dataset):
         img = img.astype(np.float32) / 255.0
         img = np.expand_dims(img, axis=0)  # [1, h, w]
 
-        # Only use verified labels that fit format
-        is_correct = record.get('isCorrect', False)
-        label_raw = record.get('label', '')
-
-        if is_correct and len(label_raw.strip()) > 0:
-            label_text = label_raw
-        else:
-            # We don't want to train on unverified labels
-            return torch.from_numpy(img), torch.LongTensor([]), 0
-
-        # Clean label: only supported characters and no whitespace
-        label_text = "".join([c for c in label_text if c in self.char_map and not c.isspace()])
-
-        # If it's a hallucination (too long) or empty, skip
-        if len(label_text) > self.max_len or len(label_text) < self.min_len:
-            return torch.from_numpy(img), torch.LongTensor([]), 0
-
+        label_text = record['clean_label']
         target = [self.char_map[c] for c in label_text]
         target_len = len(target)
 
@@ -71,7 +76,7 @@ def collate_fn(batch):
     target_lens = torch.IntTensor(target_lens)
     return imgs, targets_flat, target_lens
 
-def train(num_epochs=100, min_len=4, max_len=4):
+def train(num_epochs=50, min_len=4, max_len=4):
     # Config
     DATA_DIR = "datasets/ocr"
     LABELS_FILE = os.path.join(DATA_DIR, "labels.jsonl")
@@ -86,33 +91,109 @@ def train(num_epochs=100, min_len=4, max_len=4):
         print("No data to train on.")
         return
 
-    dataloader = DataLoader(dataset, batch_size=32, shuffle=True, collate_fn=collate_fn)
+    # Split data records
+    all_data = dataset.data
+    np.random.seed(42)
+    np.random.shuffle(all_data)
+    
+    train_split = int(0.8 * len(all_data))
+    train_records = all_data[:train_split]
+    val_records = all_data[train_split:]
 
-    model = CRNN(32, 1, n_class, 256)
-    criterion = nn.CTCLoss(blank=0, reduction='mean', zero_infinity=True)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    # # Oversample lowercase in training
+    # lowercase_records = [r for r in train_records if any(c.islower() for c in r['clean_label'])]
+    # # Double the lowercase records to give them more weight
+    # train_records_oversampled = train_records + lowercase_records
+    
+    train_dataset = CaptchaDataset(DATA_DIR, LABELS_FILE, characters, min_len=min_len, max_len=max_len, data=train_records)
+    val_dataset = CaptchaDataset(DATA_DIR, LABELS_FILE, characters, min_len=min_len, max_len=max_len, data=val_records)
 
-    print(f"Starting training on {len(dataset)} samples for {num_epochs} epochs...")
-    for epoch in range(num_epochs): # More epochs for better results
+    dataloader_train = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=collate_fn)
+    dataloader_val = DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=collate_fn)
+
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
+    logging.info(f"Using device: {device}")
+
+    model = CRNN(32, 1, n_class, 256).to(device)
+    criterion = nn.CTCLoss(blank=0, reduction='mean', zero_infinity=False)
+    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=15, factor=0.5)
+
+    # Early stopping config
+    best_val_loss = float('inf')
+    patience = 100 # Increased patience
+    counter = 0
+
+    logging.info(f"Starting training on {len(train_dataset)} training samples and {len(val_dataset)} validation samples for {num_epochs} epochs...")
+    for epoch in range(num_epochs): 
         model.train()
-        epoch_loss = 0
-        for i, (imgs, targets, target_lens) in enumerate(dataloader):
+        train_loss = 0
+        for i, (imgs, targets, target_lens) in enumerate(dataloader_train):
+            imgs = imgs.to(device)
+            targets = targets.to(device)
+            # target_lens and preds_size should stay on CPU for CTCLoss
+            
+            # If target_lens is 0, skip this batch element
+            if target_lens.sum() == 0:
+                continue
+            
             optimizer.zero_grad()
 
             # Forward
             preds = model(imgs)  # [w, b, n_class]
             preds_size = torch.IntTensor([preds.size(0)] * preds.size(1))
 
-            loss = criterion(preds.log_softmax(2), targets, preds_size, target_lens)
+            # Use log_softmax for CTC loss
+            log_probs = preds.log_softmax(2)
+            loss = criterion(log_probs, targets, preds_size, target_lens)
+            
+            if torch.isnan(loss) or torch.isinf(loss):
+                logging.warning(f"NaN or Inf loss detected at epoch {epoch}, batch {i}")
+                continue
+
             loss.backward()
             optimizer.step()
-            epoch_loss += loss.item()
+            train_loss += loss.item()
 
-        print(f"Epoch {epoch}, Loss: {epoch_loss / len(dataloader)}")
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for i, (imgs, targets, target_lens) in enumerate(dataloader_val):
+                imgs = imgs.to(device)
+                targets = targets.to(device)
+                # target_lens should stay on CPU
+
+                if target_lens.sum() == 0:
+                    continue
+                
+                preds = model(imgs)
+                preds_size = torch.IntTensor([preds.size(0)] * preds.size(1))
+                loss = criterion(preds.log_softmax(2), targets, preds_size, target_lens)
+                val_loss += loss.item()
+        
+        avg_train_loss = train_loss / len(dataloader_train) if len(dataloader_train) > 0 else 0
+        avg_val_loss = val_loss / len(dataloader_val) if len(dataloader_val) > 0 else 0
+
+        scheduler.step(avg_val_loss)
+        logging.info(f"Epoch {epoch}, Train Loss: {avg_train_loss}, Val Loss: {avg_val_loss}, LR: {optimizer.param_groups[0]['lr']}")
+
+        # Early stopping check
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            counter = 0
+            # Save best model
+            torch.save(model.state_dict(), os.path.join(DATA_DIR, "best_model.pth"))
+            logging.info(f"Saved best model at epoch {epoch}")
+        else:
+            counter += 1
+            if counter >= patience:
+                logging.info(f"Early stopping triggered at epoch {epoch}")
+                break
 
     # Export to ONNX
     print("Exporting to ONNX...")
     model.eval()
+    model.to('cpu') # Move to CPU for export
     dummy_input = torch.randn(1, 1, 32, 100)
     onnx_path = os.path.join(DATA_DIR, "ocr_model.onnx")
 
@@ -165,7 +246,7 @@ def train(num_epochs=100, min_len=4, max_len=4):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--min-len", type=int, default=4)
     parser.add_argument("--max-len", type=int, default=4)
     args = parser.parse_args()
